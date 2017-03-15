@@ -89,14 +89,12 @@ static MultiPlan * CreateInsertSelectRouterPlan(Query *originalQuery,
 												restrictionContext,
 												JoinRestrictionContext *
 												joinRestrictionContext);
-
 static Task * RouterModifyTaskForShardInterval(Query *originalQuery,
 											   ShardInterval *shardInterval,
 											   RelationRestrictionContext *
 											   restrictionContext,
 											   uint32 taskIdIndex,
 											   bool allRelationsJoinedOnPartitionKey);
-static List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex);
 static bool MasterIrreducibleExpression(Node *expression, bool *varArgument,
 										bool *badCoalesce);
 static bool MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state);
@@ -111,10 +109,6 @@ static Const * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
 static Task * RouterSelectTask(Query *originalQuery,
 							   RelationRestrictionContext *restrictionContext,
 							   List **placementList);
-static bool RouterSelectQuery(Query *originalQuery,
-							  RelationRestrictionContext *restrictionContext,
-							  List **placementList, uint64 *anchorShardId,
-							  List **relationShardList, bool replacePrunedQueryWithDummy);
 static bool RelationPrunesToMultipleShards(List *relationShardList);
 static List * TargetShardIntervalsForSelect(Query *query,
 											RelationRestrictionContext *restrictionContext);
@@ -123,8 +117,6 @@ static List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementL
 static Job * RouterQueryJob(Query *query, Task *task, List *placementList);
 static bool MultiRouterPlannableQuery(Query *query,
 									  RelationRestrictionContext *restrictionContext);
-static RelationRestrictionContext * CopyRelationRestrictionContext(
-	RelationRestrictionContext *oldContext);
 static DeferredErrorMessage * InsertSelectQuerySupported(Query *queryTree,
 														 RangeTblEntry *insertRte,
 														 RangeTblEntry *subqueryRte,
@@ -396,8 +388,8 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	bool upsertQuery = false;
 	bool replacePrunedQueryWithDummy = false;
 	bool allReferenceTables = restrictionContext->allReferenceTables;
-	List *hashedOpExpressions = NIL;
-	RestrictInfo *hashedRestrictInfo = NULL;
+	List *shardOpExpressions = NIL;
+	RestrictInfo *shardRestrictionList = NULL;
 
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
@@ -417,10 +409,10 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 			continue;
 		}
 
-		hashedOpExpressions = ShardIntervalOpExpressions(shardInterval, rteIndex);
-
-		hashedRestrictInfo = make_simple_restrictinfo((Expr *) hashedOpExpressions);
-		originalBaserestrictInfo = lappend(originalBaserestrictInfo, hashedRestrictInfo);
+		shardOpExpressions = ShardIntervalOpExpressions(shardInterval, rteIndex);
+		shardRestrictionList = make_simple_restrictinfo((Expr *) shardOpExpressions);
+		originalBaserestrictInfo = lappend(originalBaserestrictInfo,
+										   shardRestrictionList);
 
 		restriction->relOptInfo->baserestrictinfo = originalBaserestrictInfo;
 	}
@@ -532,7 +524,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
  * The function errors out if the given shard interval does not belong to a hash,
  * range and append distributed tables.
  */
-static List *
+List *
 ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex)
 {
 	Oid relationId = shardInterval->relationId;
@@ -548,7 +540,6 @@ ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex)
 			 DISTRIBUTE_BY_APPEND)
 	{
 		Assert(rteIndex > 0);
-
 		partitionColumn = PartitionColumn(relationId, rteIndex);
 	}
 	else
@@ -2224,7 +2215,7 @@ RouterSelectTask(Query *originalQuery, RelationRestrictionContext *restrictionCo
  * relationShardList is filled with the list of relation-to-shard mappings for
  * the query.
  */
-static bool
+bool
 RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionContext,
 				  List **placementList, uint64 *anchorShardId, List **relationShardList,
 				  bool replacePrunedQueryWithDummy)
@@ -2864,7 +2855,7 @@ InsertSelectQuery(Query *query)
  * plannerInfo which is read-only. All other parts of the relOptInfo is also shallowly
  * copied.
  */
-static RelationRestrictionContext *
+RelationRestrictionContext *
 CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 {
 	RelationRestrictionContext *newContext = (RelationRestrictionContext *)
