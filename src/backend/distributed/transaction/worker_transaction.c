@@ -83,7 +83,7 @@ SendCommandToWorkersParams(TargetWorkerSet targetWorkerSet, char *command,
 {
 	List *connectionList = NIL;
 	ListCell *connectionCell = NULL;
-	List *workerNodeList = WorkerNodeList();
+	List *workerNodeList = ActiveWorkerNodeList();
 	ListCell *workerNodeCell = NULL;
 	char *nodeUser = CitusExtensionOwnerName();
 

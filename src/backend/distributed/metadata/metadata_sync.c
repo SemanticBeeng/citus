@@ -99,6 +99,15 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 								"(%s,%d)", escapedNodeName, nodePort)));
 	}
 
+	if (workerNode->workerState == NODE_STATE_INACTIVE)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("you cannot sync metadata to an inactive node"),
+						errhint("First, activate the node with "
+								"SELECT master_activate_node(%s,%d)",
+								escapedNodeName, nodePort)));
+	}
+
 	MarkNodeHasMetadata(nodeNameString, nodePort, true);
 
 	/* generate and add the local group id's update query */
@@ -206,7 +215,7 @@ MetadataCreateCommands(void)
 	List *metadataSnapshotCommandList = NIL;
 	List *distributedTableList = DistributedTableList();
 	List *propagatedTableList = NIL;
-	List *workerNodeList = WorkerNodeList();
+	List *workerNodeList = ActiveWorkerNodeList();
 	ListCell *distributedTableCell = NULL;
 	char *nodeListInsertCommand = NULL;
 	bool includeSequenceDefaults = true;
@@ -401,9 +410,8 @@ NodeListInsertCommand(List *workerNodeList)
 
 	/* generate the query without any values yet */
 	appendStringInfo(nodeListInsertCommand,
-					 "INSERT INTO pg_dist_node "
-					 "(nodeid, groupid, nodename, nodeport, noderack, hasmetadata) "
-					 "VALUES ");
+					 "INSERT INTO pg_dist_node (nodeid, groupid, nodename, nodeport, "
+					 "noderack, hasmetadata, nodestate) VALUES ");
 
 	/* iterate over the worker nodes, add the values */
 	foreach(workerNodeCell, workerNodeList)
@@ -412,13 +420,14 @@ NodeListInsertCommand(List *workerNodeList)
 		char *hasMetadaString = workerNode->hasMetadata ? "TRUE" : "FALSE";
 
 		appendStringInfo(nodeListInsertCommand,
-						 "(%d, %d, %s, %d, %s, %s)",
+						 "(%d, %d, %s, %d, %s, %s, %d)",
 						 workerNode->nodeId,
 						 workerNode->groupId,
 						 quote_literal_cstr(workerNode->workerName),
 						 workerNode->workerPort,
 						 quote_literal_cstr(workerNode->workerRack),
-						 hasMetadaString);
+						 hasMetadaString,
+						 workerNode->workerState);
 
 		processedWorkerNodeCount++;
 		if (processedWorkerNodeCount != workerCount)
@@ -682,6 +691,23 @@ NodeDeleteCommand(uint32 nodeId)
 					 "WHERE nodeid = %u", nodeId);
 
 	return nodeDeleteCommand->data;
+}
+
+
+/*
+ * NodeStateUpdateCommand generates a command that can be executed to update
+ * nodestate of a node.
+ */
+char *
+NodeStateUpdateCommand(uint32 nodeId, uint32 nodeState)
+{
+	StringInfo NodeStateUpdateCommand = makeStringInfo();
+
+	appendStringInfo(NodeStateUpdateCommand,
+					 "UPDATE pg_dist_node SET nodestate = %u "
+					 "WHERE nodeid = %u", nodeState, nodeId);
+
+	return NodeStateUpdateCommand->data;
 }
 
 
@@ -973,7 +999,7 @@ OwnerName(Oid objectId)
 static bool
 HasMetadataWorkers(void)
 {
-	List *workerNodeList = WorkerNodeList();
+	List *workerNodeList = ActiveWorkerNodeList();
 	ListCell *workerNodeCell = NULL;
 
 	foreach(workerNodeCell, workerNodeList)

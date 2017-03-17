@@ -34,7 +34,8 @@ typedef enum AdvisoryLocktagClass
 	/* Citus lock types */
 	ADV_LOCKTAG_CLASS_CITUS_SHARD_METADATA = 4,
 	ADV_LOCKTAG_CLASS_CITUS_SHARD = 5,
-	ADV_LOCKTAG_CLASS_CITUS_JOB = 6
+	ADV_LOCKTAG_CLASS_CITUS_JOB = 6,
+	ADV_LOCKTAG_CLASS_CITUS_NODE_ID = 7
 } AdvisoryLocktagClass;
 
 
@@ -62,6 +63,14 @@ typedef enum AdvisoryLocktagClass
 						 (uint32) (jobid), \
 						 ADV_LOCKTAG_CLASS_CITUS_JOB)
 
+/* reuse advisory lock, but with different, unused field 4 (7) */
+#define SET_LOCKTAG_NODE_ID(tag, db, nodeid) \
+	SET_LOCKTAG_ADVISORY(tag, \
+						 db, \
+						 (uint32) ((nodeid) >> 32), \
+						 (uint32) (nodeid), \
+						 ADV_LOCKTAG_CLASS_CITUS_NODE_ID)
+
 
 /* Lock shard/relation metadata for safe modifications */
 extern void LockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode);
@@ -82,5 +91,9 @@ extern void LockShardListResources(List *shardIntervalList, LOCKMODE lockMode);
 extern void LockRelationShardResources(List *relationShardList, LOCKMODE lockMode);
 
 extern void LockMetadataSnapshot(LOCKMODE lockMode);
+
+/* Lock node id for safe node activations */
+extern void LockNodeId(int64 nodeId, LOCKMODE lockMode);
+extern bool TryLockNodeId(int64 nodeId, LOCKMODE lockMode);
 
 #endif /* RESOURCE_LOCK_H */

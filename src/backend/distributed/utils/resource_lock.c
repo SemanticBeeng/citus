@@ -342,3 +342,42 @@ LockMetadataSnapshot(LOCKMODE lockMode)
 
 	(void) LockRelationOid(DistNodeRelationId(), lockMode);
 }
+
+
+/*
+ * LockNodeId returns after grabbing a lock for distribution metadata related
+ * to the specified shard, blocking if required. Any locks acquired using this
+ * method are released at transaction end.
+ */
+void
+LockNodeId(int64 nodeId, LOCKMODE lockMode)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = false;
+
+	SET_LOCKTAG_NODE_ID(tag, MyDatabaseId, nodeId);
+
+	(void) LockAcquire(&tag, lockMode, sessionLock, dontWait);
+}
+
+
+/*
+ * TryLockNodeId tries to grab a lock for distribution metadata related to the
+ * specified shard, returning false if the lock is currently taken. Any locks
+ * acquired using this method are released at transaction end.
+ */
+bool
+TryLockNodeId(int64 nodeId, LOCKMODE lockMode)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = true;
+	bool lockAcquired = false;
+
+	SET_LOCKTAG_NODE_ID(tag, MyDatabaseId, nodeId);
+
+	lockAcquired = LockAcquire(&tag, lockMode, sessionLock, dontWait);
+
+	return lockAcquired;
+}
