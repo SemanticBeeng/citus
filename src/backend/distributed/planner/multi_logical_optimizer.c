@@ -150,7 +150,6 @@ static bool GroupedByColumn(List *groupClauseList, List *targetList, Var *column
 static void ErrorIfContainsUnsupportedSubquery(MultiNode *logicalPlanNode);
 static void ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit);
 static void ErrorIfUnsupportedTableCombination(Query *queryTree);
-static void ErrorIfUnsupportedUnionQuery(Query *unionQuery);
 static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
@@ -2926,11 +2925,7 @@ ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit)
 		SetOperationStmt *setOperationStatement =
 			(SetOperationStmt *) subqueryTree->setOperations;
 
-		if (setOperationStatement->op == SETOP_UNION)
-		{
-			ErrorIfUnsupportedUnionQuery(subqueryTree);
-		}
-		else
+		if (setOperationStatement->op != SETOP_UNION)
 		{
 			preconditionsSatisfied = false;
 			errorDetail = "Intersect and Except are currently unsupported";
@@ -3083,103 +3078,6 @@ ErrorIfUnsupportedTableCombination(Query *queryTree)
 
 	/* finally check and error out if not satisfied */
 	if (unsupporteTableCombination)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot push down this subquery"),
-						errdetail("%s", errorDetail)));
-	}
-}
-
-
-/*
- * ErrorIfUnsupportedUnionQuery checks if the given union query is a supported
- * one., otherwise it errors out. For these purpose it checks tree conditions;
- * a. Are count of partition column filters same for union subqueries.
- * b. Are target lists of union subquries include partition column.
- * c. Is it a union clause without All option.
- *
- * Note that we check equality of filters in ErrorIfUnsupportedFilters(). We
- * allow leaf queries not having a filter clause on the partition column. We
- * check if a leaf query has a filter on the partition column, it must be same
- * with other queries or if leaf query must not have any filter on the partition
- * column, both are ok. Because joins and nested queries are transitive, it is
- * enough one leaf query to have a filter on the partition column. But unions
- * are not transitive, so here we check if they have same count of filters on
- * the partition column. If count is more than 0, we already checked that they
- * are same, of if count is 0 then both don't have any filter on the partition
- * column.
- */
-static void
-ErrorIfUnsupportedUnionQuery(Query *unionQuery)
-{
-	bool supportedUnionQuery = true;
-	bool leftQueryOnPartitionColumn = false;
-	bool rightQueryOnPartitionColumn = false;
-	List *rangeTableList = unionQuery->rtable;
-	SetOperationStmt *unionStatement = (SetOperationStmt *) unionQuery->setOperations;
-	Query *leftQuery = NULL;
-	Query *rightQuery = NULL;
-	List *leftOpExpressionList = NIL;
-	List *rightOpExpressionList = NIL;
-	uint32 leftOpExpressionCount = 0;
-	uint32 rightOpExpressionCount = 0;
-	char *errorDetail = NULL;
-
-	RangeTblRef *leftRangeTableReference = (RangeTblRef *) unionStatement->larg;
-	RangeTblRef *rightRangeTableReference = (RangeTblRef *) unionStatement->rarg;
-
-	int leftTableIndex = leftRangeTableReference->rtindex - 1;
-	int rightTableIndex = rightRangeTableReference->rtindex - 1;
-
-	RangeTblEntry *leftRangeTableEntry = (RangeTblEntry *) list_nth(rangeTableList,
-																	leftTableIndex);
-	RangeTblEntry *rightRangeTableEntry = (RangeTblEntry *) list_nth(rangeTableList,
-																	 rightTableIndex);
-
-	Assert(leftRangeTableEntry->rtekind == RTE_SUBQUERY);
-	Assert(rightRangeTableEntry->rtekind == RTE_SUBQUERY);
-
-	leftQuery = leftRangeTableEntry->subquery;
-	rightQuery = rightRangeTableEntry->subquery;
-
-	/*
-	 * Check if subqueries of union have same count of filters on partition
-	 * column.
-	 */
-	leftOpExpressionList = PartitionColumnOpExpressionList(leftQuery);
-	rightOpExpressionList = PartitionColumnOpExpressionList(rightQuery);
-
-	leftOpExpressionCount = list_length(leftOpExpressionList);
-	rightOpExpressionCount = list_length(rightOpExpressionList);
-
-	if (leftOpExpressionCount != rightOpExpressionCount)
-	{
-		supportedUnionQuery = false;
-		errorDetail = "Union clauses need to have same count of filters on "
-					  "partition column";
-	}
-
-	/* check if union subqueries have partition column in their target lists */
-	leftQueryOnPartitionColumn = TargetListOnPartitionColumn(leftQuery,
-															 leftQuery->targetList);
-	rightQueryOnPartitionColumn = TargetListOnPartitionColumn(rightQuery,
-															  rightQuery->targetList);
-
-	if (!(leftQueryOnPartitionColumn && rightQueryOnPartitionColumn))
-	{
-		supportedUnionQuery = false;
-		errorDetail = "Union clauses need to select partition columns";
-	}
-
-	/* check if it is a union all operation */
-	if (unionStatement->all)
-	{
-		supportedUnionQuery = false;
-		errorDetail = "Union All clauses are currently unsupported";
-	}
-
-	/* finally check and error out if not satisfied */
-	if (!supportedUnionQuery)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot push down this subquery"),
