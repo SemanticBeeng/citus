@@ -173,13 +173,12 @@ FROM
 ERROR:  cannot perform distributed planning for the given query
 DETAIL:  Select query cannot be pushed down to the worker.
 -- Check that we error out if there is union all.
-SELECT count(*) FROM
-(
-   (SELECT l_orderkey FROM lineitem_subquery) UNION ALL
-   (SELECT 1::bigint)
-) b;
-ERROR:  cannot push down this subquery
-DETAIL:  Union All clauses are currently unsupported
+-- TEMPORARLY DISABLE UNION ALL
+-- SELECT count(*) FROM
+-- (
+--   (SELECT l_orderkey FROM lineitem_subquery) UNION ALL
+--   (SELECT 1::bigint)
+--) b;
 ---
 -- TEMPORARLY DISABLE UNIONS WITHOUT JOINS
 ---
