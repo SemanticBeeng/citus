@@ -38,8 +38,8 @@ END;
 $BODY$ LANGUAGE plpgsql;
 
 -- VACUMM relates tables to ensure test outputs are stable
-VACUUM (FULL) lineitem;
-VACUUM (FULL) orders;
+VACUUM ANALYZE lineitem;
+VACUUM ANALYZE orders;
 
 -- Test Text format
 EXPLAIN (COSTS FALSE, FORMAT TEXT)
