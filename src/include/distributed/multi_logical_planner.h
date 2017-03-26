@@ -197,6 +197,8 @@ extern List * JoinClauseList(List *whereClauseList);
 extern bool IsJoinClause(Node *clause);
 extern List * SubqueryEntryList(Query *queryTree);
 extern bool ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
+extern bool ExtractSetOperationRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
+extern bool ExtractSetOperationWalker(Node *node, List **setOperationList);
 extern List * WhereClauseList(FromExpr *fromExpr);
 extern List * QualifierList(FromExpr *fromExpr);
 extern List * TableEntryList(List *rangeTableList);

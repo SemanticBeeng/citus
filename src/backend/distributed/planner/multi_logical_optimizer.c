@@ -2927,17 +2927,24 @@ ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit)
 
 	if (subqueryTree->setOperations)
 	{
-		SetOperationStmt *setOperationStatement =
-			(SetOperationStmt *) subqueryTree->setOperations;
+		List *setOperationList = NIL;
+		ListCell *setOperationCell = NULL;
 
-		if (setOperationStatement->op == SETOP_UNION)
+		ExtractSetOperationWalker(subqueryTree->setOperations, &setOperationList);
+
+		foreach(setOperationCell, setOperationList)
 		{
-			ErrorIfUnsupportedUnionQuery(subqueryTree);
-		}
-		else
-		{
-			preconditionsSatisfied = false;
-			errorDetail = "Intersect and Except are currently unsupported";
+			SetOperationStmt *setOperationStatement = (SetOperationStmt *) lfirst(setOperationCell);
+
+			if (setOperationStatement->op == SETOP_UNION)
+			{
+				ErrorIfUnsupportedUnionQuery(subqueryTree);
+			}
+			else
+			{
+				preconditionsSatisfied = false;
+				errorDetail = "Intersect and Except are currently unsupported";
+			}
 		}
 	}
 

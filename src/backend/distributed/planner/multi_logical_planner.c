@@ -123,7 +123,7 @@ MultiLogicalPlanCreate(Query *queryTree)
 	MultiNode *multiQueryNode = NULL;
 	MultiTreeRoot *rootNode = NULL;
 
-	//ereport(WARNING, (errmsg("Query : %s", nodeToString(queryTree))));
+	/*ereport(WARNING, (errmsg("Query : %s", nodeToString(queryTree)))); */
 	List *subqueryEntryList = SubqueryEntryList(queryTree);
 	if (subqueryEntryList != NIL)
 	{
@@ -171,39 +171,7 @@ SubqueryEntryList(Query *queryTree)
 	 * subqueries.
 	 */
 	ExtractRangeTableIndexWalker((Node *) queryTree->jointree, &joinTreeTableIndexList);
-
-	{
-		List *setOperationList = NIL;
-
-		if (queryTree->setOperations != NULL)
-		{
-			setOperationList = list_make1(queryTree->setOperations);
-		}
-
-		while (setOperationList != NIL)
-		{
-			Node *setOperationNode = linitial(setOperationList);
-			setOperationList = list_delete_first(setOperationList);
-
-			Assert(setOperationNode != NULL);
-			if (IsA(setOperationNode, RangeTblRef))
-			{
-				RangeTblRef *rangeTblRef = (RangeTblRef *) setOperationNode;
-				joinTreeTableIndexList = lappend_int(joinTreeTableIndexList, rangeTblRef->rtindex);
-			}
-			else if (IsA(setOperationNode, SetOperationStmt))
-			{
-				SetOperationStmt *setOperationStmt = (SetOperationStmt *) setOperationNode;
-				setOperationList = lappend(setOperationList, setOperationStmt->larg);
-				setOperationList = lappend(setOperationList, setOperationStmt->rarg);
-			}
-			else
-			{
-				ereport(ERROR, (errmsg("Unexpected node in set operation traversal")));
-			}
-		}
-	}
-
+	ExtractSetOperationRangeTableIndexWalker(queryTree->setOperations, &joinTreeTableIndexList);
 
 	foreach(joinTreeTableIndexCell, joinTreeTableIndexList)
 	{
@@ -439,7 +407,19 @@ ErrorIfQueryNotSupported(Query *queryTree, bool subquery)
 	}
 	else if (queryTree->setOperations && subquery)
 	{
-		ereport(WARNING, (errmsg("Set Operations %s", nodeToString(queryTree->setOperations))));
+		List *setOperationList = NIL;
+		ListCell *setOperationCell = NULL;
+
+		ExtractSetOperationWalker(queryTree->setOperations, &setOperationList);
+		foreach(setOperationCell, setOperationList)
+		{
+			SetOperationStmt *setOperationStatement = (SetOperationStmt *) lfirst(setOperationCell);
+			if (setOperationStatement->op != SETOP_UNION)
+			{
+				preconditionsSatisfied = false;
+				errorMessage = "Intersect and Except are currently unsupported in subqueries";
+			}
+		};
 	}
 
 	if (queryTree->hasRecursive)
@@ -833,6 +813,49 @@ ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList)
 		walkerResult = expression_tree_walker(node, ExtractRangeTableIndexWalker,
 											  rangeTableIndexList);
 	}
+
+	return walkerResult;
+}
+
+bool
+ExtractSetOperationRangeTableIndexWalker(Node *node, List **rangeTableIndexList)
+{
+	bool walkerResult = false;
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, RangeTblRef))
+	{
+		int rangeTableIndex = ((RangeTblRef *) node)->rtindex;
+		(*rangeTableIndexList) = lappend_int(*rangeTableIndexList, rangeTableIndex);
+	}
+	else
+	{
+		walkerResult = expression_tree_walker(node, ExtractSetOperationRangeTableIndexWalker,
+											  rangeTableIndexList);
+	}
+
+	return walkerResult;
+}
+
+bool
+ExtractSetOperationWalker(Node *node, List **setOperationList)
+{
+	bool walkerResult = false;
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, SetOperationStmt))
+	{
+		(*setOperationList) = lappend(*setOperationList, node);
+	}
+
+	walkerResult = expression_tree_walker(node, ExtractSetOperationWalker,
+			setOperationList);
 
 	return walkerResult;
 }
@@ -2092,6 +2115,7 @@ SubqueryPushdownMultiPlanTree(Query *queryTree, List *subqueryEntryList)
 	List *subqueryTargetEntryList = NIL;
 	List *columnNamesList = NIL;
 	StringInfo rteName = makeStringInfo();
+	List *knownColumnList = NIL;
 
 	appendStringInfo(rteName, "citus_subquery_name");
 
@@ -2109,12 +2133,16 @@ SubqueryPushdownMultiPlanTree(Query *queryTree, List *subqueryEntryList)
 	 * here we are updating columns in the most outer query for where clause
 	 * list and target list accordingly.
 	 */
-	//Assert(list_length(subqueryEntryList) == 1);
+	/*Assert(list_length(subqueryEntryList) == 1); */
 
 	qualifierColumnList = pull_var_clause_default((Node *) qualifierList);
 	targetListColumnList = pull_var_clause_default((Node *) targetEntryList);
 
 	columnList = list_concat(targetListColumnList, qualifierColumnList);
+
+
+
+#if 0
 	targetNo = 1;
 	foreach(columnCell, columnList)
 	{
@@ -2129,39 +2157,62 @@ SubqueryPushdownMultiPlanTree(Query *queryTree, List *subqueryEntryList)
 	 */
 
 	qualifierList = QualifierList(queryCopy->jointree);
-	//ereport(WARNING, (errmsg("queryCopy->jointree  : %s", CitusNodeToString(queryCopy->jointree))));
-	//ereport(WARNING, (errmsg("qualifierList  : %s", CitusNodeToString(qualifierList))));
+	/*ereport(WARNING, (errmsg("queryCopy->jointree  : %s", CitusNodeToString(queryCopy->jointree)))); */
+	/*ereport(WARNING, (errmsg("qualifierList  : %s", CitusNodeToString(qualifierList)))); */
 
-	targetListColumnList = pull_var_clause_default((Node *)  queryCopy->targetList);
+	targetListColumnList = pull_var_clause_default((Node *) queryCopy->targetList);
 	qualifierColumnList = pull_var_clause_default((Node *) qualifierList);
-	//ereport(WARNING, (errmsg("qualifierColumnList  : %s", CitusNodeToString(qualifierColumnList))));
+	/*ereport(WARNING, (errmsg("qualifierColumnList  : %s", CitusNodeToString(qualifierColumnList)))); */
 
 
 	columnList = list_concat_unique(targetListColumnList, qualifierColumnList);
 
-	//ereport(WARNING, (errmsg("columnList  : %s", CitusNodeToString(columnList))));
+	/*ereport(WARNING, (errmsg("columnList  : %s", CitusNodeToString(columnList)))); */
+
+	targetNo = 1;
+#endif
 
 	subqueryTargetEntryList = NIL;
-	targetNo = 1;
+
 	foreach(columnCell, columnList)
 	{
 		TargetEntry *newTargetEntry = makeNode(TargetEntry);
+		ListCell *knownColumnCell = NULL;
 		StringInfo columnNameString = makeStringInfo();
 		Var *column = (Var *) lfirst(columnCell);
+		Var *foundColumn = NULL;
+		targetNo = 1;
+		foreach (knownColumnCell, knownColumnList)
+		{
+			Var *knownColumn = (Var *) knownColumnCell;
+			if (knownColumn->varno == column->varno && knownColumn->varattno == column->varattno)
+			{
+				foundColumn = knownColumn;
+				break;
+			}
+			targetNo++;
+		}
 
-		newTargetEntry->expr = (Expr *) column;
+		if (foundColumn == NULL)
+		{
+			knownColumnList = lappend(knownColumnList, copyObject(column));
+			newTargetEntry->expr = (Expr *) copyObject(column);
 
-		appendStringInfo(columnNameString, WORKER_COLUMN_FORMAT,
-				targetNo);
-		newTargetEntry->resname = columnNameString->data;
+			appendStringInfo(columnNameString, WORKER_COLUMN_FORMAT,
+							 targetNo);
+			newTargetEntry->resname = columnNameString->data;
 
-		/* force resjunk to false as we may need this on the master */
-		newTargetEntry->resjunk = false;
-		newTargetEntry->resno = targetNo;
+			/* force resjunk to false as we may need this on the master */
+			newTargetEntry->resjunk = false;
+			newTargetEntry->resno = targetNo;
 
-		subqueryTargetEntryList = lappend(subqueryTargetEntryList, newTargetEntry);
-		columnNamesList = lappend(columnNamesList, makeString(columnNameString->data));
-		targetNo++;
+			subqueryTargetEntryList = lappend(subqueryTargetEntryList, newTargetEntry);
+			columnNamesList = lappend(columnNamesList, makeString(columnNameString->data));
+		}
+
+		column->varno = 1;
+		column->varattno = targetNo;
+
 	}
 
 	queryCopy->targetList = subqueryTargetEntryList;
@@ -2171,9 +2222,11 @@ SubqueryPushdownMultiPlanTree(Query *queryTree, List *subqueryEntryList)
 	queryCopy->hasAggs = false;
 	queryCopy->distinctClause = NIL;
 	queryCopy->hasDistinctOn = false;
+	queryCopy->limitCount = NULL;
+	queryCopy->limitOffset = NULL;
 
 	/* create multi node for the subquery */
-	//subqueryRangeTableEntry = (RangeTblEntry *) linitial(subqueryEntryList);
+	/*subqueryRangeTableEntry = (RangeTblEntry *) linitial(subqueryEntryList); */
 	subqueryRangeTableEntry = makeNode(RangeTblEntry);
 	subqueryRangeTableEntry->subquery = queryCopy;
 	subqueryRangeTableEntry->alias = makeNode(Alias);
@@ -2211,9 +2264,9 @@ SubqueryPushdownMultiPlanTree(Query *queryTree, List *subqueryEntryList)
 	SetChild((MultiUnaryNode *) extendedOpNode, currentTopNode);
 	currentTopNode = (MultiNode *) extendedOpNode;
 
-	//ereport(WARNING, (errmsg("MultiTree : %s", CitusNodeToString(currentTopNode))));
+	/*ereport(WARNING, (errmsg("MultiTree : %s", CitusNodeToString(currentTopNode)))); */
 
-	//ereport(WARNING, (errmsg("SubQuery  : %s", CitusNodeToString(subqueryNode->subquery->targetList))));
+	/*ereport(WARNING, (errmsg("SubQuery  : %s", CitusNodeToString(subqueryNode->subquery->targetList)))); */
 
 
 	return currentTopNode;
