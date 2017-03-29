@@ -273,7 +273,7 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 	DistTableCacheEntry *targetCacheEntry = DistributedTableCacheEntry(targetRelationId);
 	int shardCount = targetCacheEntry->shardIntervalArrayLength;
 	bool allReferenceTables = restrictionContext->allReferenceTables;
-	bool allRelationsJoinedOnPartitionKey = false;
+	bool safeToPushDownSubquery = false;
 
 	multiPlan->operation = originalQuery->commandType;
 
@@ -289,8 +289,8 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 		return multiPlan;
 	}
 
-	allRelationsJoinedOnPartitionKey =
-		AllRelationsJoinedOnPartitionKey(restrictionContext, joinRestrictionContext);
+	safeToPushDownSubquery = SafeToPushDownSubquery(restrictionContext,
+													joinRestrictionContext);
 
 	/*
 	 * Plan select query for each shard in the target table. Do so by replacing the
@@ -309,7 +309,7 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 
 		modifyTask = RouterModifyTaskForShardInterval(originalQuery, targetShardInterval,
 													  restrictionContext, taskIdIndex,
-													  allRelationsJoinedOnPartitionKey);
+													  safeToPushDownSubquery);
 
 		/* add the task if it could be created */
 		if (modifyTask != NULL)

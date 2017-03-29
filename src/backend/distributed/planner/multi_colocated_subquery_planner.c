@@ -14,6 +14,7 @@
 #include "distributed/multi_colocated_subquery_planner.h"
 #include "distributed/multi_planner.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_logical_optimizer.h"
 #include "distributed/pg_dist_partition.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
@@ -62,6 +63,16 @@ typedef struct AttributeEquivalenceClassMember
 } AttributeEquivalenceClassMember;
 
 
+static bool SafeToPushdownTopLevelUnion(RelationRestrictionContext *restrictionContext);
+static Var * FindTranslatedVar(List *appendRelList, Oid relationOid,
+							   Index relationRteIndex, Index *partitionKeyIndex);
+static bool AllRelationsJoinedOnPartitionKey(RelationRestrictionContext *
+											 restrictionContext,
+											 JoinRestrictionContext *
+											 joinRestrictionContext);
+static bool EquivalenceListContainsRelationsEquality(List *attributeEquivalenceList,
+													 RelationRestrictionContext *
+													 restrictionContext);
 static uint32 ReferenceRelationCount(RelationRestrictionContext *restrictionContext);
 static List * GenerateAttributeEquivalencesForRelationRestrictions(
 	RelationRestrictionContext *restrictionContext);
@@ -102,6 +113,187 @@ static void ListConcatUniqueAttributeClassMemberLists(AttributeEquivalenceClass 
 													  firstClass,
 													  AttributeEquivalenceClass *
 													  secondClass);
+static bool TopLevelUnionQuery(Query *queryTree);
+static Index RelationRestrictionPartitionKeyIndex(RelationRestriction *
+												  relationRestriction);
+
+
+/*
+ * SafeToPushDownSubquery returns true if either
+ *    (i)  there exists join in the query and all relations joined on their
+ *         partition keys
+ *    (ii) there exists only union set operations and all relations has
+ *         partition keys in the same ordinal position in the query
+ */
+bool
+SafeToPushDownSubquery(RelationRestrictionContext *restrictionContext,
+					   JoinRestrictionContext *joinRestrictionContext)
+{
+	bool allRelationsJoinedOnPartitionKey =
+		AllRelationsJoinedOnPartitionKey(restrictionContext, joinRestrictionContext);
+
+	if (allRelationsJoinedOnPartitionKey)
+	{
+		return true;
+	}
+
+	if (TopLevelUnionQuery(restrictionContext->parseTree))
+	{
+		return SafeToPushdownTopLevelUnion(restrictionContext);
+	}
+
+	return false;
+}
+
+
+/*
+ * SafeToPushdownTopLevelUnion returns true if all the relations are returns
+ * partition keys in the same ordinal position.
+ *
+ * Note that the function expects (and asserts) the input query to be a top
+ * level union query defined by TopLevelUnionQuery().
+ */
+static bool
+SafeToPushdownTopLevelUnion(RelationRestrictionContext *restrictionContext)
+{
+	Index unionQueryPartitionKeyIndex = 0;
+	AttributeEquivalenceClass *attributeEquivalance =
+		palloc0(sizeof(AttributeEquivalenceClass));
+	ListCell *relationRestrictionCell = NULL;
+
+	Assert(TopLevelUnionQuery(restrictionContext->parseTree));
+
+	attributeEquivalance->equivalenceId = attributeEquivalenceId++;
+
+	foreach(relationRestrictionCell, restrictionContext->relationRestrictionList)
+	{
+		RelationRestriction *relationRestriction = lfirst(relationRestrictionCell);
+		Index partitionKeyIndex = InvalidAttrNumber;
+		PlannerInfo *relationPlannerRoot = relationRestriction->plannerInfo;
+		List *targetList = relationPlannerRoot->parse->targetList;
+		List *appendRelList = relationPlannerRoot->append_rel_list;
+		Var *varToBeAdded = NULL;
+		TargetEntry *targetEntryToAdd = NULL;
+
+		/* we first check whether UNION ALLs are pulled up */
+		if (appendRelList != NULL)
+		{
+			varToBeAdded = FindTranslatedVar(appendRelList,
+											 relationRestriction->relationId,
+											 relationRestriction->index,
+											 &partitionKeyIndex);
+
+			/* union does not have partition key in the target list */
+			if (partitionKeyIndex == 0)
+			{
+				return false;
+			}
+		}
+		else
+		{
+			partitionKeyIndex =
+				RelationRestrictionPartitionKeyIndex(relationRestriction);
+
+			/* union does not have partition key in the target list */
+			if (partitionKeyIndex == 0)
+			{
+				return false;
+			}
+
+			targetEntryToAdd = list_nth(targetList, partitionKeyIndex - 1);
+			if (!IsA(targetEntryToAdd->expr, Var))
+			{
+				return false;
+			}
+
+			varToBeAdded = (Var *) targetEntryToAdd->expr;
+		}
+
+		/*
+		 * If the first relation doesn't have partition key on the target
+		 * list of the query that the relation in, simply not allow to push down
+		 * the query.
+		 */
+		if (partitionKeyIndex == InvalidAttrNumber)
+		{
+			return false;
+		}
+
+		/*
+		 * We find the first relations partition key index in the target list. Later,
+		 * we check whether all the relations have partition keys in the
+		 * same position.
+		 */
+		if (unionQueryPartitionKeyIndex == InvalidAttrNumber)
+		{
+			unionQueryPartitionKeyIndex = partitionKeyIndex;
+		}
+		else if (unionQueryPartitionKeyIndex != partitionKeyIndex)
+		{
+			return false;
+		}
+
+		AddToAttributeEquivalenceClass(relationPlannerRoot, varToBeAdded,
+									   &attributeEquivalance);
+	}
+
+	return EquivalenceListContainsRelationsEquality(list_make1(attributeEquivalance),
+													restrictionContext);
+}
+
+
+/*
+ * FindTranslatedVar iterates on the appendRelList and tries to find a translated
+ * child var identified by the relation id and the relation rte index. The function
+ * returns NULL if it cannot find a translated var.
+ */
+static Var *
+FindTranslatedVar(List *appendRelList, Oid relationOid, Index relationRteIndex,
+				  Index *partitionKeyIndex)
+{
+	ListCell *appendRelCell = NULL;
+
+	*partitionKeyIndex = 0;
+
+	/* iterate on the queries that are part of UNION ALL subselects */
+	foreach(appendRelCell, appendRelList)
+	{
+		AppendRelInfo *appendRelInfo = (AppendRelInfo *) lfirst(appendRelCell);
+		List *translaterVars = appendRelInfo->translated_vars;
+		ListCell *translatedVarCell = NULL;
+		AttrNumber childAttrNumber = 0;
+		Var *relationPartitionKey = NULL;
+
+		/*
+		 * We're only interested in the child rel that is equal to the
+		 * relation we're investigating.
+		 */
+		if (appendRelInfo->child_relid != relationRteIndex)
+		{
+			continue;
+		}
+
+		relationPartitionKey = PartitionKey(relationOid);
+
+		foreach(translatedVarCell, translaterVars)
+		{
+			Var *targetVar = (Var *) lfirst(translatedVarCell);
+
+			childAttrNumber++;
+
+			if (targetVar->varno == relationRteIndex &&
+				targetVar->varattno == relationPartitionKey->varattno)
+			{
+				*partitionKeyIndex = childAttrNumber;
+
+				return targetVar;
+			}
+		}
+	}
+
+	return NULL;
+}
+
 
 /*
  * AllRelationsJoinedOnPartitionKey aims to deduce whether each of the RTE_RELATION
@@ -131,21 +323,16 @@ static void ListConcatUniqueAttributeClassMemberLists(AttributeEquivalenceClass 
  * Finally, as the name of the function reveals, the function returns true if all relations
  * are joined on their partition keys. Otherwise, the function returns false.
  */
-bool
+static bool
 AllRelationsJoinedOnPartitionKey(RelationRestrictionContext *restrictionContext,
 								 JoinRestrictionContext *joinRestrictionContext)
 {
 	List *relationRestrictionAttributeEquivalenceList = NIL;
 	List *joinRestrictionAttributeEquivalenceList = NIL;
 	List *allAttributeEquivalenceList = NIL;
-	AttributeEquivalenceClass *commonEquivalenceClass = NULL;
 	uint32 referenceRelationCount = ReferenceRelationCount(restrictionContext);
 	uint32 totalRelationCount = list_length(restrictionContext->relationRestrictionList);
 	uint32 nonReferenceRelationCount = totalRelationCount - referenceRelationCount;
-
-	ListCell *commonEqClassCell = NULL;
-	ListCell *relationRestrictionCell = NULL;
-	Relids commonRteIdentities = NULL;
 
 	/*
 	 * If the query includes a single relation which is not a reference table,
@@ -175,12 +362,33 @@ AllRelationsJoinedOnPartitionKey(RelationRestrictionContext *restrictionContext,
 		list_concat(relationRestrictionAttributeEquivalenceList,
 					joinRestrictionAttributeEquivalenceList);
 
+	return EquivalenceListContainsRelationsEquality(allAttributeEquivalenceList,
+													restrictionContext);
+}
+
+
+/*
+ * EquivalenceListContainsRelationsEquality gets a list of attributed equivalence
+ * list and a relation restriction context. The function first generates a common
+ * equivalence class out of the attributeEquivalenceList. Later, the function checks
+ * whether all the relations exists in the common equivalence class.
+ *
+ */
+static bool
+EquivalenceListContainsRelationsEquality(List *attributeEquivalenceList,
+										 RelationRestrictionContext *restrictionContext)
+{
+	AttributeEquivalenceClass *commonEquivalenceClass = NULL;
+	ListCell *commonEqClassCell = NULL;
+	ListCell *relationRestrictionCell = NULL;
+	Relids commonRteIdentities = NULL;
+
 	/*
 	 * In general we're trying to expand existing the equivalence classes to find a
 	 * common equivalence class. The main goal is to test whether this main class
 	 * contains all partition keys of the existing relations.
 	 */
-	commonEquivalenceClass = GenerateCommonEquivalence(allAttributeEquivalenceList);
+	commonEquivalenceClass = GenerateCommonEquivalence(attributeEquivalenceList);
 
 	/* add the rte indexes of relations to a bitmap */
 	foreach(commonEqClassCell, commonEquivalenceClass->equivalentAttributes)
@@ -950,4 +1158,94 @@ AddAttributeClassToAttributeClassList(AttributeEquivalenceClass *attributeEquiva
 									   attributeEquivalance);
 
 	return attributeEquivalenceList;
+}
+
+
+/*
+ * TopLevelUnionQuery gets a queryTree and returns true if top level query
+ * contains a UNION set operation. Note that the function allows upper level
+ * queries with a single range table element. In other words, we allow top
+ * level unions being wrapped into aggregations queries and/or simple projection
+ * queries that only selects some fields from the lower level queries.
+ *
+ * If there exists joins before the set operations, the function returns false.
+ * Similarly, if the query does not contain any union set operations, the
+ * function returns false.
+ */
+static bool
+TopLevelUnionQuery(Query *queryTree)
+{
+	List *rangeTableList = queryTree->rtable;
+	Node *setOperations = queryTree->setOperations;
+	RangeTblEntry *rangeTableEntry = NULL;
+	Query *subqueryTree = NULL;
+
+	/* don't allow joines on top of unions */
+	if (list_length(rangeTableList) > 1)
+	{
+		return false;
+	}
+
+	rangeTableEntry = linitial(rangeTableList);
+	if (rangeTableEntry->rtekind != RTE_SUBQUERY)
+	{
+		return false;
+	}
+
+	subqueryTree = rangeTableEntry->subquery;
+	setOperations = subqueryTree->setOperations;
+	if (setOperations != NULL)
+	{
+		SetOperationStmt *setOperationStatement = (SetOperationStmt *) setOperations;
+
+		if (setOperationStatement->op != SETOP_UNION)
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	return TopLevelUnionQuery(subqueryTree);
+}
+
+
+/*
+ * RelationRestrictionPartitionKeyIndex gets a relation restriction and finds the
+ * index that the partition key of the relation exists in the query. The query is
+ * found in the planner info of the relation restriction.
+ */
+static Index
+RelationRestrictionPartitionKeyIndex(RelationRestriction *relationRestriction)
+{
+	PlannerInfo *relationPlannerRoot = NULL;
+	Query *relationPlannerParseQuery = NULL;
+	List *relationTargetList = NIL;
+	ListCell *targetEntryCell = NULL;
+	Index partitionKeyTargetAttrIndex = 0;
+
+	relationPlannerRoot = relationRestriction->plannerInfo;
+	relationPlannerParseQuery = relationPlannerRoot->parse;
+	relationTargetList = relationPlannerParseQuery->targetList;
+
+	foreach(targetEntryCell, relationTargetList)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+		Expr *targetExpression = targetEntry->expr;
+
+		partitionKeyTargetAttrIndex++;
+
+		if (!targetEntry->resjunk &&
+			IsPartitionColumn(targetExpression, relationPlannerParseQuery))
+		{
+			Var *targetColumn = (Var *) targetExpression;
+
+			if (targetColumn->varno == relationRestriction->index)
+			{
+				return partitionKeyTargetAttrIndex;
+			}
+		}
+	}
+
+	return InvalidAttrNumber;
 }

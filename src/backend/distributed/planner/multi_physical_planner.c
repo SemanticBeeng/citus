@@ -2022,8 +2022,8 @@ SubquerySqlTaskList(Job *job, RelationRestrictionContext *restrictionContext,
 	int shardCount = 0;
 	int shardOffset = 0;
 	DistTableCacheEntry *targetCacheEntry = NULL;
-	bool allRelationsJoinedOnPartitionKey =
-		AllRelationsJoinedOnPartitionKey(restrictionContext, joinRestrictionContext);
+	bool safeToPushDownSubquery = SafeToPushDownSubquery(restrictionContext,
+														 joinRestrictionContext);
 
 	/* get list of all range tables in subquery tree */
 	ExtractRangeTableRelationWalker((Node *) subquery, &rangeTableList);
@@ -2060,8 +2060,8 @@ SubquerySqlTaskList(Job *job, RelationRestrictionContext *restrictionContext,
 		Task *subqueryTask = NULL;
 
 		subqueryTask = SubqueryTaskCreate(subquery, targetShardInterval,
-										  allRelationsJoinedOnPartitionKey,
-										  restrictionContext, taskIdIndex);
+										  safeToPushDownSubquery, restrictionContext,
+										  taskIdIndex);
 
 
 		/* add the task if it could be created */

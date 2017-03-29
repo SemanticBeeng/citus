@@ -15,10 +15,10 @@
 #include "distributed/multi_planner.h"
 
 
-extern bool AllRelationsJoinedOnPartitionKey(RelationRestrictionContext *
-											 restrictionContext,
-											 JoinRestrictionContext *
-											 joinRestrictionContext);
+extern bool SafeToPushDownSubquery(RelationRestrictionContext *
+								   restrictionContext,
+								   JoinRestrictionContext *
+								   joinRestrictionContext);
 
 
 #endif /* MULTI_COLOCATED_SUBQUERY_PLANNER_H */

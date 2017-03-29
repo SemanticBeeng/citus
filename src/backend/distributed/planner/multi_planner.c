@@ -77,7 +77,7 @@ static RelationRestrictionContext * CurrentRestrictionContext(void);
 static JoinRestrictionContext * CurrentJoinRestrictionContext(void);
 static void PopRestrictionContexts(void);
 static bool HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams);
-
+#include "nodes/print.h"
 
 /* Distributed planner hook */
 PlannedStmt *
@@ -117,6 +117,8 @@ multi_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 		if (needsDistributedPlanning)
 		{
+			relationRestrictionContext->parseTree = copyObject(originalQuery);
+
 			result = CreateDistributedPlan(result, originalQuery, parse,
 										   boundParams, relationRestrictionContext,
 										   joinRestrictionContext);

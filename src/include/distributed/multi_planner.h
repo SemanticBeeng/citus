@@ -27,6 +27,7 @@ typedef struct RelationRestrictionContext
 	bool hasLocalRelation;
 	bool allReferenceTables;
 	List *relationRestrictionList;
+	Query *parseTree;
 } RelationRestrictionContext;
 
 typedef struct RelationRestriction
