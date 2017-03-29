@@ -3081,19 +3081,6 @@ ErrorIfUnsupportedTableCombination(Query *queryTree)
 		}
 	}
 
-	if ((subqueryRangeTableCount > 0) && (relationRangeTableCount > 0))
-	{
-		unsupporteTableCombination = true;
-		errorDetail = "Joins between regular tables and subqueries are unsupported";
-	}
-
-	if ((relationRangeTableCount > 2) || (subqueryRangeTableCount > 2))
-	{
-		unsupporteTableCombination = true;
-		errorDetail = "Joins between more than two relations and subqueries are "
-					  "unsupported";
-	}
-
 	/* finally check and error out if not satisfied */
 	if (unsupporteTableCombination)
 	{
