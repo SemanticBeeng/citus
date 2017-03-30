@@ -42,6 +42,7 @@
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -149,6 +150,9 @@ static bool GroupedByColumn(List *groupClauseList, List *targetList, Var *column
 /* Local functions forward declarations for subquery pushdown checks */
 static void ErrorIfContainsUnsupportedSubquery(MultiNode *logicalPlanNode);
 static void ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit);
+static void ErrorIfUnsupportedUnionQuery(List *rangeTableList,
+										 SetOperationStmt *setOperationStatement,
+										 bool outerQueryHasLimit);
 static void ErrorIfUnsupportedTableCombination(Query *queryTree);
 static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
@@ -2925,11 +2929,8 @@ ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit)
 		SetOperationStmt *setOperationStatement =
 			(SetOperationStmt *) subqueryTree->setOperations;
 
-		if (setOperationStatement->op != SETOP_UNION)
-		{
-			preconditionsSatisfied = false;
-			errorDetail = "Intersect and Except are currently unsupported";
-		}
+		ErrorIfUnsupportedUnionQuery(subqueryTree->rtable, setOperationStatement,
+									 outerQueryHasLimit);
 	}
 
 	if (subqueryTree->hasRecursive)
@@ -3016,6 +3017,63 @@ ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit)
 
 		Query *innerSubquery = rangeTableEntry->subquery;
 		ErrorIfCannotPushdownSubquery(innerSubquery, outerQueryHasLimit);
+	}
+}
+
+
+/*
+ * ErrorIfUnsupportedUnionQuery is a helper function for ErrorIfCannotPushdownSubquery().
+ * It basically iterates over the subqueries that reside under the given set operations.
+ *
+ * The function also errors out for set operations INTERSECT and EXCEPT.
+ */
+static void
+ErrorIfUnsupportedUnionQuery(List *rangeTableList,
+							 SetOperationStmt *setOperationStatement,
+							 bool outerQueryHasLimit)
+{
+	Node *leftArgument = setOperationStatement->larg;
+	Node *rightArgument = setOperationStatement->rarg;
+
+	if (setOperationStatement->op != SETOP_UNION)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot push down this subquery"),
+						errdetail("Intersect and Except are currently unsupported")));
+	}
+
+	if (IsA(leftArgument, RangeTblRef))
+	{
+		RangeTblRef *rangeTableReference = (RangeTblRef *) leftArgument;
+		RangeTblEntry *rangeTableEntry = rt_fetch(rangeTableReference->rtindex,
+												  rangeTableList);
+
+		Assert(rangeTableEntry->rtekind == RTE_SUBQUERY);
+
+		ErrorIfCannotPushdownSubquery(rangeTableEntry->subquery, outerQueryHasLimit);
+	}
+	else if (IsA(leftArgument, SetOperationStmt))
+	{
+		SetOperationStmt *leftUnion = (SetOperationStmt *) leftArgument;
+
+		ErrorIfUnsupportedUnionQuery(rangeTableList, leftUnion, outerQueryHasLimit);
+	}
+
+	if (IsA(rightArgument, RangeTblRef))
+	{
+		RangeTblRef *rangeTableReference = (RangeTblRef *) rightArgument;
+		RangeTblEntry *rangeTableEntry = rt_fetch(rangeTableReference->rtindex,
+												  rangeTableList);
+
+		Assert(rangeTableEntry->rtekind == RTE_SUBQUERY);
+
+		ErrorIfCannotPushdownSubquery(rangeTableEntry->subquery, outerQueryHasLimit);
+	}
+	else if (IsA(rightArgument, SetOperationStmt))
+	{
+		SetOperationStmt *rightUnion = (SetOperationStmt *) rightArgument;
+
+		ErrorIfUnsupportedUnionQuery(rangeTableList, rightUnion, outerQueryHasLimit);
 	}
 }
 
