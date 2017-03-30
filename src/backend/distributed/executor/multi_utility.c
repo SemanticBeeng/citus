@@ -372,14 +372,6 @@ multi_ProcessUtility(Node *parsetree,
 	standard_ProcessUtility(parsetree, queryString, context,
 							params, dest, completionTag);
 
-	/* we control alter table statement here to use same checks with creating table */
-	if (IsA(parsetree, AlterTableStmt))
-	{
-		AlterTableStmt *alterTableStatement = (AlterTableStmt *) parsetree;
-
-		ErrorIfUnsupportedAlterAddConstraintStmt(alterTableStatement);
-	}
-
 	if (commandMustRunAsOwner)
 	{
 		SetUserIdAndSecContext(savedUserId, savedSecurityContext);
@@ -389,6 +381,14 @@ multi_ProcessUtility(Node *parsetree,
 	if (ddlJobs != NIL)
 	{
 		ListCell *ddlJobCell = NULL;
+
+		/* check the created table's constraints using the same logic with create table*/
+		if (IsA(parsetree, AlterTableStmt))
+		{
+			AlterTableStmt *alterTableStatement = (AlterTableStmt *) parsetree;
+
+			ErrorIfUnsupportedAlterAddConstraintStmt(alterTableStatement);
+		}
 
 		foreach(ddlJobCell, ddlJobs)
 		{
@@ -1871,7 +1871,6 @@ static void
 ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
 {
 	Oid relationId = InvalidOid;
-	bool isDistributedRelation = false;
 	LOCKMODE lockmode = 0;
 
 	Relation relation = NULL;
@@ -1879,15 +1878,8 @@ ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
 	Var *distributionColumn = NULL;
 	uint32 colocationId = 0;
 
-	/* continue if it is not distributed table */
 	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
 	relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
-
-	isDistributedRelation = IsDistributedTable(relationId);
-	if (!isDistributedRelation)
-	{
-		return;
-	}
 
 	distributionMethod = PartitionMethod(relationId);
 	distributionColumn = PartitionKey(relationId);
