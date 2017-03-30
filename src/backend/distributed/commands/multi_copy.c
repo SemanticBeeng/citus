@@ -839,7 +839,8 @@ CanUseBinaryCopyFormat(TupleDesc tupleDescription, CopyOutState rowOutputState)
 		{
 			get_type_category_preferred(typeId, &typeCategory, &typePreferred);
 			if (typeCategory == TYPCATEGORY_ARRAY ||
-				typeCategory == TYPCATEGORY_COMPOSITE)
+				typeCategory == TYPCATEGORY_COMPOSITE ||
+				typeCategory == TYPCATEGORY_USER)
 			{
 				useBinaryCopyFormat = false;
 				break;
