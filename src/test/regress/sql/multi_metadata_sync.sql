@@ -276,7 +276,6 @@ DROP INDEX mx_test_schema_2.mx_index_3;
 SET citus.multi_shard_commit_protocol TO '2pc';
 ALTER TABLE mx_test_schema_1.mx_table_1 ADD COLUMN col3 NUMERIC;
 ALTER TABLE mx_test_schema_1.mx_table_1 ALTER COLUMN col3 SET DATA TYPE INT;
-SHOW citus.shard_replication_factor;
 ALTER TABLE 
 	mx_test_schema_1.mx_table_1 
 ADD CONSTRAINT 
@@ -292,7 +291,6 @@ REFERENCES
 \c - - - :master_port
 SET citus.multi_shard_commit_protocol TO '2pc';
 ALTER TABLE mx_test_schema_1.mx_table_1 DROP CONSTRAINT mx_fk_constraint; 
-SHOW citus.shard_replication_factor;
 ALTER TABLE 
 	mx_test_schema_1.mx_table_1 
 ADD CONSTRAINT 

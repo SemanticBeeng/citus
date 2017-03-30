@@ -1672,6 +1672,7 @@ ErrorIfNotSupportedForeignConstraint(Relation relation, char distributionMethod,
 	int scanKeyCount = 1;
 	HeapTuple heapTuple = NULL;
 
+	Oid referencingTableId = relation->rd_id;
 	Oid referencedTableId = InvalidOid;
 	uint32 referencedTableColocationId = INVALID_COLOCATION_ID;
 	Var *referencedTablePartitionColumn = NULL;
@@ -1840,8 +1841,11 @@ ErrorIfNotSupportedForeignConstraint(Relation relation, char distributionMethod,
 		 * greater than 1. Because in our current design, multiple replicas may cause
 		 * locking problems and inconsistent shard contents.
 		 */
-		if (ShardReplicationFactor > 1 || (referencedTableId != relation->rd_id &&
-										   !SingleReplicatedTable(referencedTableId)))
+		if ((IsDistributedTable(referencingTableId) &&
+			 !SingleReplicatedTable(referencingTableId)) ||
+			(!IsDistributedTable(referencingTableId) &&
+			 ShardReplicationFactor > 1) || (referencedTableId != relation->rd_id &&
+											 !SingleReplicatedTable(referencedTableId)))
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cannot create foreign key constraint"),
@@ -1887,7 +1891,7 @@ ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
 
 	relation = relation_open(relationId, ExclusiveLock);
 	ErrorIfNotSupportedConstraint(relation, distributionMethod, distributionColumn,
-							      colocationId);
+								  colocationId);
 	relation_close(relation, NoLock);
 }
 
