@@ -93,6 +93,8 @@ static Param * UninstantiatedParameterForColumn(Var *relationPartitionKey);
 static bool MasterIrreducibleExpression(Node *expression, bool *varArgument,
 										bool *badCoalesce);
 static bool MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state);
+static bool ExpressionContainsParam(Node *expression);
+static bool ExpressionContainsParamWalker(Node *expression, WalkerState *state);
 static char MostPermissiveVolatileFlag(char left, char right);
 static bool TargetEntryChangesValue(TargetEntry *targetEntry, Var *column,
 									FromExpr *joinTree);
@@ -100,7 +102,7 @@ static Task * RouterModifyTask(Query *originalQuery, Query *query);
 static ShardInterval * TargetShardIntervalForModify(Query *query);
 static List * QueryRestrictList(Query *query);
 static bool FastShardPruningPossible(CmdType commandType, char partitionMethod);
-static Const * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
+static Expr * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
 static Task * RouterSelectTask(Query *originalQuery,
 							   RelationRestrictionContext *restrictionContext,
 							   List **placementList);
@@ -1519,7 +1521,7 @@ ModifyQuerySupported(Query *queryTree)
 			}
 
 			if (commandType == CMD_INSERT && targetEntryPartitionColumn &&
-				!IsA(targetEntry->expr, Const))
+				ExpressionContainsParam((Node *) targetEntry->expr))
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									 "values given for the partition column must be"
@@ -1893,6 +1895,36 @@ MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state)
 
 
 /*
+ * ExpressionContainsParam determines whether the given expression contains
+ * an uninstantiated parameter.
+ */
+static bool
+ExpressionContainsParam(Node *expression)
+{
+	return ExpressionContainsParamWalker(expression, NULL);
+}
+
+
+/*
+ * ExpressionContainsParamWalker is the recursive expression_tree_walker
+ * for ExpressionContainsParam.
+ */
+static bool
+ExpressionContainsParamWalker(Node *expression, WalkerState *state)
+{
+	if (IsA(expression, Param))
+	{
+		return true;
+	}
+
+	/* keep traversing */
+	return expression_tree_walker(expression,
+								  ExpressionContainsParamWalker,
+								  state);
+}
+
+
+/*
  * Return the most-pessimistic volatility flag of the two params.
  *
  * for example: given two flags, if one is stable and one is volatile, an expression
@@ -1973,23 +2005,27 @@ TargetEntryChangesValue(TargetEntry *targetEntry, Var *column, FromExpr *joinTre
 static Task *
 RouterModifyTask(Query *originalQuery, Query *query)
 {
-	ShardInterval *shardInterval = TargetShardIntervalForModify(query);
-	uint64 shardId = shardInterval->shardId;
-	Oid distributedTableId = shardInterval->relationId;
-	StringInfo queryString = makeStringInfo();
 	Task *modifyTask = NULL;
-	bool upsertQuery = false;
+	Oid distributedTableId = ExtractFirstDistributedTableId(query);
 	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	StringInfo queryString = makeStringInfo();
+	ShardInterval *shardInterval = NULL;
 
-	/* grab shared metadata lock to stop concurrent placement additions */
-	LockShardDistributionMetadata(shardId, ShareLock);
+	modifyTask = CitusMakeNode(Task);
+	modifyTask->jobId = INVALID_JOB_ID;
+	modifyTask->taskId = INVALID_TASK_ID;
+	modifyTask->taskType = MODIFY_TASK;
+	modifyTask->queryString = NULL;
+	modifyTask->anchorShardId = INVALID_SHARD_ID;
+	modifyTask->dependedTaskList = NIL;
+	modifyTask->replicationModel = cacheEntry->replicationModel;
 
 	if (originalQuery->onConflict != NULL)
 	{
 		RangeTblEntry *rangeTableEntry = NULL;
 
 		/* set the flag */
-		upsertQuery = true;
+		modifyTask->upsertQuery = true;
 
 		/* setting an alias simplifies deparsing of UPSERTs */
 		rangeTableEntry = linitial(originalQuery->rtable);
@@ -2000,18 +2036,21 @@ RouterModifyTask(Query *originalQuery, Query *query)
 		}
 	}
 
-	deparse_shard_query(originalQuery, shardInterval->relationId, shardId, queryString);
-	ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
+	shardInterval = TargetShardIntervalForModify(query);
+	if (shardInterval != NULL)
+	{
+		uint64 shardId = shardInterval->shardId;
 
-	modifyTask = CitusMakeNode(Task);
-	modifyTask->jobId = INVALID_JOB_ID;
-	modifyTask->taskId = INVALID_TASK_ID;
-	modifyTask->taskType = MODIFY_TASK;
-	modifyTask->queryString = queryString->data;
-	modifyTask->anchorShardId = shardId;
-	modifyTask->dependedTaskList = NIL;
-	modifyTask->upsertQuery = upsertQuery;
-	modifyTask->replicationModel = cacheEntry->replicationModel;
+		/* grab shared metadata lock to stop concurrent placement additions */
+		LockShardDistributionMetadata(shardId, ShareLock);
+
+		deparse_shard_query(originalQuery, shardInterval->relationId, shardId,
+							queryString);
+		ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
+
+		modifyTask->queryString = queryString->data;
+		modifyTask->anchorShardId = shardId;
+	}
 
 	return modifyTask;
 }
@@ -2021,6 +2060,8 @@ RouterModifyTask(Query *originalQuery, Query *query)
  * TargetShardIntervalForModify determines the single shard targeted by a provided
  * modify command. If no matching shards exist, or if the modification targets more
  * than one shard, this function raises an error depending on the command type.
+ * If the shard interval cannot be determined because the partition column contains
+ * an expression that still needs to be evaluated, it returns NULL.
  */
 static ShardInterval *
 TargetShardIntervalForModify(Query *query)
@@ -2031,7 +2072,6 @@ TargetShardIntervalForModify(Query *query)
 	Oid distributedTableId = ExtractFirstDistributedTableId(query);
 	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
 	char partitionMethod = cacheEntry->partitionMethod;
-	bool fastShardPruningPossible = false;
 	CmdType commandType = query->commandType;
 	const char *commandName = NULL;
 
@@ -2066,28 +2106,17 @@ TargetShardIntervalForModify(Query *query)
 								"and try again.")));
 	}
 
-	fastShardPruningPossible = FastShardPruningPossible(query->commandType,
-														partitionMethod);
-	if (fastShardPruningPossible)
+	if (commandType == CMD_INSERT)
 	{
-		uint32 rangeTableId = 1;
-		Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
-		Const *partitionValueConst = ExtractInsertPartitionValue(query, partitionColumn);
-		Datum partitionValue = partitionValueConst->constvalue;
-		ShardInterval *shardInterval = FastShardPruning(distributedTableId,
-														partitionValue);
-
-		if (shardInterval != NULL)
-		{
-			prunedShardList = lappend(prunedShardList, shardInterval);
-		}
+		return FindShardForInsert(query);
 	}
 	else
 	{
 		List *restrictClauseList = QueryRestrictList(query);
 		Index tableId = 1;
-		List *shardIntervalList = LoadShardIntervalList(distributedTableId);
+		List *shardIntervalList = NIL;
 
+		shardIntervalList = LoadShardIntervalList(distributedTableId);
 		prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
 										 shardIntervalList);
 	}
@@ -2111,26 +2140,12 @@ TargetShardIntervalForModify(Query *query)
 			targetCountType = "multiple";
 		}
 
-		if (commandType == CMD_INSERT && prunedShardCount == 0)
-		{
-			appendStringInfo(errorHint, "Make sure you have created a shard which "
-										"can receive this partition column value.");
-		}
-		else if (commandType == CMD_INSERT)
-		{
-			appendStringInfo(errorHint, "Make sure the value for partition column "
-										"\"%s\" falls into a single shard.",
-							 partitionColumnName);
-		}
-		else
-		{
-			appendStringInfo(errorHint, "Consider using an equality filter on "
-										"partition column \"%s\" to target a "
-										"single shard. If you'd like to run a "
-										"multi-shard operation, use "
-										"master_modify_multiple_shards().",
-							 partitionColumnName);
-		}
+		appendStringInfo(errorHint, "Consider using an equality filter on "
+									"partition column \"%s\" to target a "
+									"single shard. If you'd like to run a "
+									"multi-shard operation, use "
+									"master_modify_multiple_shards().",
+						 partitionColumnName);
 
 		if (commandType == CMD_DELETE && partitionMethod == DISTRIBUTE_BY_APPEND)
 		{
@@ -2145,6 +2160,134 @@ TargetShardIntervalForModify(Query *query)
 						errmsg("cannot run %s command which targets %s shards",
 							   commandName, targetCountType),
 						showHint ? errhint("%s", errorHint->data) : 0));
+	}
+
+	return (ShardInterval *) linitial(prunedShardList);
+}
+
+
+/*
+ * FindShardForInsert finds the shard interval for an INSERT query or
+ * NULL if the partition column value is defined as an expression that
+ * still needs to be evaluated.
+ */
+ShardInterval *
+FindShardForInsert(Query *query)
+{
+	Oid distributedTableId = ExtractFirstDistributedTableId(query);
+	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	char partitionMethod = cacheEntry->partitionMethod;
+	bool fastShardPruningPossible = false;
+	uint32 rangeTableId = 1;
+	Var *partitionColumn = NULL;
+	Expr *partitionValueExpr = NULL;
+	Const *partitionValueConst = NULL;
+	List *shardIntervalList = NIL;
+	List *prunedShardList = NIL;
+	int prunedShardCount = 0;
+
+	Assert(query->commandType == CMD_INSERT);
+
+	/* reference tables can only have one shard */
+	if (partitionMethod == DISTRIBUTE_BY_NONE)
+	{
+		int shardCount = 0;
+
+		shardIntervalList = LoadShardIntervalList(distributedTableId);
+		shardCount = list_length(shardIntervalList);
+
+		if (shardCount != 1)
+		{
+			ereport(ERROR, (errmsg("reference table cannot have %d shards", shardCount)));
+		}
+
+		return (ShardInterval *) linitial(shardIntervalList);
+	}
+
+	partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
+
+	partitionValueExpr = ExtractInsertPartitionValue(query, partitionColumn);
+	if (!IsA(partitionValueExpr, Const))
+	{
+		/* shard pruning not possible right now */
+		return NULL;
+	}
+
+	partitionValueConst = (Const *) partitionValueExpr;
+	if (partitionValueConst->constisnull)
+	{
+		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						errmsg("cannot perform an INSERT with NULL in the partition "
+							   "column")));
+	}
+
+	fastShardPruningPossible = FastShardPruningPossible(query->commandType,
+														partitionMethod);
+	if (fastShardPruningPossible)
+	{
+		Datum partitionValue = partitionValueConst->constvalue;
+		ShardInterval *shardInterval = FastShardPruning(distributedTableId,
+														partitionValue);
+		if (shardInterval != NULL)
+		{
+			prunedShardList = list_make1(shardInterval);
+		}
+	}
+	else
+	{
+		List *restrictClauseList = NIL;
+		Index tableId = 1;
+		OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
+		Node *rightOp = get_rightop((Expr *) equalityExpr);
+		Const *rightConst = (Const *) rightOp;
+
+		Assert(IsA(rightOp, Const));
+
+		rightConst->constvalue = partitionValueConst->constvalue;
+		rightConst->constisnull = partitionValueConst->constisnull;
+		rightConst->constbyval = partitionValueConst->constbyval;
+
+		restrictClauseList = list_make1(equalityExpr);
+
+		shardIntervalList = LoadShardIntervalList(distributedTableId);
+		prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
+										 shardIntervalList);
+	}
+
+	prunedShardCount = list_length(prunedShardList);
+	if (prunedShardCount != 1)
+	{
+		char *partitionKeyString = cacheEntry->partitionKeyString;
+		char *partitionColumnName = ColumnNameToColumn(distributedTableId,
+													   partitionKeyString);
+		StringInfo errorHint = makeStringInfo();
+		const char *targetCountType = NULL;
+
+		if (prunedShardCount == 0)
+		{
+			targetCountType = "no";
+		}
+		else
+		{
+			targetCountType = "multiple";
+		}
+
+		if (prunedShardCount == 0)
+		{
+			appendStringInfo(errorHint, "Make sure you have created a shard which "
+										"can receive this partition column value.");
+		}
+		else
+		{
+			appendStringInfo(errorHint, "Make sure the value for partition column "
+										"\"%s\" falls into a single shard.",
+							 partitionColumnName);
+		}
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot run INSERT command which targets %s shards",
+							   targetCountType),
+						errhint("%s", errorHint->data)));
 	}
 
 	return (ShardInterval *) linitial(prunedShardList);
@@ -2231,7 +2374,6 @@ static List *
 QueryRestrictList(Query *query)
 {
 	List *queryRestrictList = NIL;
-	CmdType commandType = query->commandType;
 	Oid distributedTableId = ExtractFirstDistributedTableId(query);
 	char partitionMethod = PartitionMethod(distributedTableId);
 
@@ -2244,30 +2386,7 @@ QueryRestrictList(Query *query)
 		return queryRestrictList;
 	}
 
-	if (commandType == CMD_INSERT)
-	{
-		/* build equality expression based on partition column value for row */
-		uint32 rangeTableId = 1;
-		Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
-		Const *partitionValue = ExtractInsertPartitionValue(query, partitionColumn);
-
-		OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
-
-		Node *rightOp = get_rightop((Expr *) equalityExpr);
-		Const *rightConst = (Const *) rightOp;
-		Assert(IsA(rightOp, Const));
-
-		rightConst->constvalue = partitionValue->constvalue;
-		rightConst->constisnull = partitionValue->constisnull;
-		rightConst->constbyval = partitionValue->constbyval;
-
-		queryRestrictList = list_make1(equalityExpr);
-	}
-	else if (commandType == CMD_UPDATE || commandType == CMD_DELETE ||
-			 commandType == CMD_SELECT)
-	{
-		queryRestrictList = WhereClauseList(query->jointree);
-	}
+	queryRestrictList = WhereClauseList(query->jointree);
 
 	return queryRestrictList;
 }
@@ -2308,27 +2427,19 @@ ExtractFirstDistributedTableId(Query *query)
  * of an INSERT command. If a partition value is missing altogether or is
  * NULL, this function throws an error.
  */
-static Const *
+static Expr *
 ExtractInsertPartitionValue(Query *query, Var *partitionColumn)
 {
-	Const *partitionValue = NULL;
 	TargetEntry *targetEntry = get_tle_by_resno(query->targetList,
 												partitionColumn->varattno);
-	if (targetEntry != NULL)
-	{
-		Assert(IsA(targetEntry->expr, Const));
-
-		partitionValue = (Const *) targetEntry->expr;
-	}
-
-	if (partitionValue == NULL || partitionValue->constisnull)
+	if (targetEntry == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-						errmsg("cannot plan INSERT using row with NULL value "
-							   "in partition column")));
+						errmsg("cannot perform an INSERT without a partition column "
+							   "value")));
 	}
 
-	return partitionValue;
+	return targetEntry->expr;
 }
 
 
@@ -2721,18 +2832,34 @@ RouterQueryJob(Query *query, Task *task, List *placementList)
 	TaskType taskType = task->taskType;
 	bool requiresMasterEvaluation = false;
 
-	/*
-	 * We send modify task to the first replica, otherwise we choose the target shard
-	 * according to task assignment policy. Placement list for select queries are
-	 * provided as function parameter.
-	 */
 	if (taskType == MODIFY_TASK)
 	{
-		taskList = FirstReplicaAssignTaskList(list_make1(task));
-		requiresMasterEvaluation = RequiresMasterEvaluation(query);
+		if (task->anchorShardId != INVALID_SHARD_ID)
+		{
+			/*
+			 * We were able to assign a shard ID. Generate task
+			 * placement list using the first-replica assignment
+			 * policy (modify placements in placement ID order).
+			 */
+			taskList = FirstReplicaAssignTaskList(list_make1(task));
+			requiresMasterEvaluation = RequiresMasterEvaluation(query);
+		}
+		else
+		{
+			/*
+			 * We were unable to assign a shard ID yet, meaning
+			 * the partition column value is an expression.
+			 */
+			taskList = list_make1(task);
+			requiresMasterEvaluation = true;
+		}
 	}
 	else
 	{
+		/*
+		 * For selects we get the placement list during shard
+		 * pruning.
+		 */
 		Assert(placementList != NIL);
 
 		task->taskPlacementList = placementList;

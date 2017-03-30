@@ -74,6 +74,9 @@ bool EnableDeadlockPrevention = true;
 
 /* functions needed during run phase */
 static void ReacquireMetadataLocks(List *taskList);
+static bool IsShardPruningDeferred(Query *jobQuery, List *taskList);
+static void AssignInsertTaskShardId(Query *jobQuery, List *taskList);
+static void AssignTaskPlacements(Job *workerJob);
 static void ExecuteSingleModifyTask(CitusScanState *scanState, Task *task,
 									bool expectResults);
 static void ExecuteSingleSelectTask(CitusScanState *scanState, Task *task);
@@ -87,7 +90,6 @@ static List * TaskShardIntervalList(List *taskList);
 static void AcquireExecutorShardLock(Task *task, CmdType commandType);
 static void AcquireExecutorMultiShardLocks(List *taskList);
 static bool RequiresConsistentSnapshot(Task *task);
-static void ProcessMasterEvaluableFunctions(Job *workerJob);
 static void ExtractParametersFromParamListInfo(ParamListInfo paramListInfo,
 											   Oid **parameterTypes,
 											   const char ***parameterValues);
@@ -406,7 +408,11 @@ RequiresConsistentSnapshot(Task *task)
 
 
 /*
- * CitusModifyBeginScan checks the validity of the given custom scan node and
+ * CitusModifyBeginScan first evaluates one-time function calls in the query,
+ * and performs partition pruning in case the partition column in an insert
+ * was defined as a function call.
+ *
+ * The function also checks the validity of the given custom scan node and
  * gets locks on the shards involved in the task list of the distributed plan.
  */
 void
@@ -415,7 +421,22 @@ CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags)
 	CitusScanState *scanState = (CitusScanState *) node;
 	MultiPlan *multiPlan = scanState->multiPlan;
 	Job *workerJob = multiPlan->workerJob;
+	Query *jobQuery = workerJob->jobQuery;
 	List *taskList = workerJob->taskList;
+	bool deferredPruning = false;
+
+	if (workerJob->requiresMasterEvaluation)
+	{
+		ExecuteMasterEvaluableFunctions(jobQuery);
+
+		deferredPruning = IsShardPruningDeferred(jobQuery, taskList);
+		if (deferredPruning)
+		{
+			AssignInsertTaskShardId(jobQuery, taskList);
+		}
+
+		RebuildQueryStrings(jobQuery, taskList);
+	}
 
 	/*
 	 * If we are executing a prepared statement, then we may not yet have obtained
@@ -428,6 +449,91 @@ CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags)
 	 * locks as early as possible.
 	 */
 	ReacquireMetadataLocks(taskList);
+
+	/*
+	 * If we deferred shard pruning to the executor, then we still need to assign
+	 * shard placements. We do this after acquiring the metadata locks to ensure
+	 * we can't get stale metadata. At some point, we may want to load all
+	 * placement metadata here.
+	 */
+	if (deferredPruning)
+	{
+		AssignTaskPlacements(workerJob);
+	}
+}
+
+
+/*
+ * IsShardPruning determines whether we deferred shard pruning for the
+ * given job. Currently, we only defer shard pruning for inserts with
+ * a function call in the partition column.
+ */
+static bool
+IsShardPruningDeferred(Query *jobQuery, List *taskList)
+{
+	bool deferredPruning = false;
+
+	if (jobQuery->commandType == CMD_INSERT)
+	{
+		Task *insertTask = NULL;
+
+		Assert(list_length(taskList) == 1);
+
+		insertTask = (Task *) linitial(taskList);
+		if (insertTask->anchorShardId == INVALID_SHARD_ID)
+		{
+			deferredPruning = true;
+		}
+	}
+
+	return deferredPruning;
+}
+
+
+/*
+ * AssignInsertTaskShardId performs shard pruning for an insert and sets
+ * anchorShardId accordingly.
+ */
+static void
+AssignInsertTaskShardId(Query *jobQuery, List *taskList)
+{
+	ShardInterval *shardInterval = NULL;
+	Task *insertTask = NULL;
+
+	Assert(jobQuery->commandType == CMD_INSERT);
+
+	/*
+	 * We skipped shard pruning in the planner because the partition
+	 * column contained an expression. Perform shard pruning now.
+	 */
+	shardInterval = FindShardForInsert(jobQuery);
+	if (shardInterval == NULL)
+	{
+		/* expression could not be evalauted */
+		ereport(ERROR, (errmsg("values given for the partition column must "
+							   "be constants or constant expressions")));
+	}
+
+	/* assign a shard ID to the task */
+	insertTask = (Task *) linitial(taskList);
+	insertTask->anchorShardId = shardInterval->shardId;
+}
+
+
+/*
+ * AssignTaskPlacements assigns placements to tasks. We currently only do
+ * this for inserts and follow the same logic as the router planner.
+ */
+static void
+AssignTaskPlacements(Job *workerJob)
+{
+	Query *jobQuery PG_USED_FOR_ASSERTS_ONLY = workerJob->jobQuery;
+	Task *insertTask = NULL;
+
+	Assert(jobQuery->commandType == CMD_INSERT);
+
+	insertTask = (Task *) linitial(workerJob->taskList);
+	workerJob->taskList = FirstReplicaAssignTaskList(list_make1(insertTask));
 }
 
 
@@ -449,8 +555,6 @@ RouterSingleModifyExecScan(CustomScanState *node)
 		List *taskList = workerJob->taskList;
 		Task *task = (Task *) linitial(taskList);
 
-		ProcessMasterEvaluableFunctions(workerJob);
-
 		ExecuteSingleModifyTask(scanState, task, hasReturning);
 
 		scanState->finishedRemoteScan = true;
@@ -459,24 +563,6 @@ RouterSingleModifyExecScan(CustomScanState *node)
 	resultSlot = ReturnTupleFromTuplestore(scanState);
 
 	return resultSlot;
-}
-
-
-/*
- * ProcessMasterEvaluableFunctions executes evaluable functions and rebuilds
- * the query strings in task lists.
- */
-static void
-ProcessMasterEvaluableFunctions(Job *workerJob)
-{
-	if (workerJob->requiresMasterEvaluation)
-	{
-		Query *jobQuery = workerJob->jobQuery;
-		List *taskList = workerJob->taskList;
-
-		ExecuteMasterEvaluableFunctions(jobQuery);
-		RebuildQueryStrings(jobQuery, taskList);
-	}
 }
 
 
@@ -498,8 +584,6 @@ RouterMultiModifyExecScan(CustomScanState *node)
 		List *taskList = workerJob->taskList;
 		bool hasReturning = multiPlan->hasReturning;
 		bool isModificationQuery = true;
-
-		ProcessMasterEvaluableFunctions(workerJob);
 
 		ExecuteMultipleTasks(scanState, taskList, isModificationQuery, hasReturning);
 
@@ -529,8 +613,6 @@ RouterSelectExecScan(CustomScanState *node)
 		Job *workerJob = multiPlan->workerJob;
 		List *taskList = workerJob->taskList;
 		Task *task = (Task *) linitial(taskList);
-
-		ProcessMasterEvaluableFunctions(workerJob);
 
 		ExecuteSingleSelectTask(scanState, task);
 
