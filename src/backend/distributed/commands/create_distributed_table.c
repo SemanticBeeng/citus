@@ -20,9 +20,7 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
-#include "catalog/indexing.h"
 #include "catalog/pg_am.h"
-#include "catalog/pg_constraint.h"
 #if (PG_VERSION_NUM >= 90600)
 #include "catalog/pg_constraint_fn.h"
 #endif
@@ -30,7 +28,6 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_trigger.h"
-#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
@@ -60,7 +57,6 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"

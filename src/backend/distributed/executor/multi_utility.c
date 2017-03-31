@@ -382,7 +382,7 @@ multi_ProcessUtility(Node *parsetree,
 	{
 		ListCell *ddlJobCell = NULL;
 
-		/* check the created table's constraints using the same logic with create table*/
+		/* check the altered table's constraints using the same logic with create table */
 		if (IsA(parsetree, AlterTableStmt))
 		{
 			AlterTableStmt *alterTableStatement = (AlterTableStmt *) parsetree;
@@ -1384,7 +1384,7 @@ ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement)
  * ALTER TABLE ALTER COLUMN SET DATA TYPE
  * ALTER TABLE SET|DROP NOT NULL
  * ALTER TABLE SET|DROP DEFAULT
- * ALTER TABLE ADD|DROP CONSTRAINT FOREIGN
+ * ALTER TABLE ADD|DROP CONSTRAINT
  */
 static void
 ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
@@ -1435,7 +1435,6 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 			case AT_DropColumn:
 			case AT_ColumnDefault:
 			case AT_AlterColumnType:
-			case AT_SetNotNull:
 			case AT_DropNotNull:
 			{
 				/* error out if the alter table command is on the partition column */
@@ -1502,6 +1501,7 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				break;
 			}
 
+			case AT_SetNotNull:
 			case AT_DropConstraint:
 			{
 				/* we will no perform any special check for ALTER TABLE DROP CONSTRAINT */
@@ -1876,7 +1876,6 @@ ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
 {
 	Oid relationId = InvalidOid;
 	LOCKMODE lockmode = 0;
-
 	Relation relation = NULL;
 	char distributionMethod;
 	Var *distributionColumn = NULL;
